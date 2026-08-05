@@ -1278,12 +1278,30 @@ def _hull_2d(pts):
     return half(ps)[:-1] + half(list(reversed(ps)))[:-1]
 
 
-def ridge_axis(pts):
-    """Which way the ridge should run, for any footprint shape.
+def longest_wall_axis(pts):
+    """Ridge direction taken from the longest wall of the plan.
 
-    The long axis of the smallest rectangle that encloses the plan. Rotating
-    calipers on the hull: the minimum-area rectangle always has a side flush
-    with a hull edge, so testing one frame per hull edge finds it exactly.
+    What a builder does: the ridge runs parallel to the main facade. On a plain
+    rectangle this agrees with the bounding box, but on a plan whose longest
+    wall runs at an angle to its bounding box the two disagree, and the wall is
+    the one that reads as correct from the street.
+    """
+    best, best_len = (1.0, 0.0), -1.0
+    for i in range(len(pts)):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % len(pts)]
+        ex, ey = bx - ax, by - ay
+        length = math.hypot(ex, ey)
+        if length > best_len:
+            best, best_len = (ex / length, ey / length), length
+    return best, (-best[1], best[0])
+
+
+def ridge_axis(pts):
+    """The long axis of the smallest rectangle that encloses the plan.
+
+    Rotating calipers on the hull: the minimum-area rectangle always has a side
+    flush with a hull edge, so testing one frame per hull edge finds it exactly.
 
     Principal-component axes were the obvious alternative and are worse here --
     PCA is pulled around by where the vertices happen to be dense, so a plan
@@ -1377,8 +1395,10 @@ def gable_roof_geometry(loop, pitch=35.0, overhang=0.0, axis="AUTO"):
         u, v = (1.0, 0.0), (0.0, 1.0)
     elif axis == "Y":
         u, v = (0.0, 1.0), (-1.0, 0.0)
-    else:
+    elif axis == "BOX":
         u, v = ridge_axis(pts2)
+    else:
+        u, v = longest_wall_axis(pts2)
 
     tan_p = math.tan(math.radians(pitch))
     eps = 1e-9
@@ -1592,6 +1612,117 @@ def gable_roof_geometry(loop, pitch=35.0, overhang=0.0, axis="AUTO"):
     return verts, faces
 
 
+def edge_normals(loop):
+    """Outward normal of every edge, whichever way the loop is wound."""
+    area = 0.0
+    for i in range(len(loop)):
+        a, b = loop[i], loop[(i + 1) % len(loop)]
+        area += a.x * b.y - b.x * a.y
+    sign = 1.0 if area > 0.0 else -1.0      # +1 when wound anticlockwise
+
+    normals = []
+    for i in range(len(loop)):
+        a, b = loop[i], loop[(i + 1) % len(loop)]
+        ex, ey = b.x - a.x, b.y - a.y
+        length = math.hypot(ex, ey)
+        if length < 1e-9:
+            normals.append(Vector((0.0, 0.0)))
+        else:
+            normals.append(Vector((ey / length * sign, -ex / length * sign)))
+    return normals
+
+
+def offset_loop(loop, dists):
+    """Push each edge out by its own distance; corners follow the edges.
+
+    Moving the vertices instead would shorten every wall by a corner's worth,
+    so each corner is rebuilt where its two moved edges now meet.
+    """
+    normals = edge_normals(loop)
+    out = []
+    for i in range(len(loop)):
+        j = (i - 1) % len(loop)
+        pa = loop[j] + Vector((normals[j].x, normals[j].y, 0.0)) * dists[j]
+        pb = loop[i] + Vector((normals[i].x, normals[i].y, 0.0)) * dists[i]
+        da = loop[i] - loop[j]
+        db = loop[(i + 1) % len(loop)] - loop[i]
+        cross = da.x * db.y - da.y * db.x
+        if abs(cross) < 1e-9:               # the two walls run on: no corner
+            out.append(pb.copy())
+            continue
+        t = ((pb.x - pa.x) * db.y - (pb.y - pa.y) * db.x) / cross
+        out.append(Vector((pa.x + da.x * t, pa.y + da.y * t, loop[i].z)))
+    return out
+
+
+def modules_at_roof_edge(roof_ob, context):
+    """The assets standing on the roof's boundary -- the trim ring.
+
+    Buildify's flat roof is the bare footprint, but the trim that sits on its
+    edge projects past it and stands above it. Roofing to the footprint
+    therefore lands the eaves short of the building and a storey too low. The
+    ring is found by height rather than by name, so a swapped kit still works.
+    """
+    col = context.scene.blm_props.modules_collection
+    pool = list(col.objects) if col else [
+        o for o in context.view_layer.objects if is_module(o)]
+
+    z_roof = max((roof_ob.matrix_world @ v.co).z
+                 for v in roof_ob.data.vertices)
+    standing, reaching = [], []
+    for ob in pool:
+        if ob is roof_ob or ob.type != "MESH" or not ob.data.vertices:
+            continue
+        top = max((ob.matrix_world @ v.co).z for v in ob.data.vertices)
+        if top > z_roof + 1e-3:
+            standing.append(ob)
+        elif top > z_roof - 0.01:
+            reaching.append(ob)
+    return (standing or reaching), z_roof
+
+
+def fit_loop_to_modules(loop, roof_ob, context):
+    """Move the eave line out and up onto the assets at the roof's edge.
+
+    Returns the adjusted loop and a note, or (loop, None) when there is
+    nothing to fit to.
+    """
+    mods, z_roof = modules_at_roof_edge(roof_ob, context)
+    if not mods:
+        return loop, None
+
+    pts = [(v, ob.matrix_world @ v.co)
+           for ob in mods for v in ob.data.vertices]
+    normals = edge_normals(loop)
+
+    dists = []
+    for i in range(len(loop)):
+        a, b = loop[i], loop[(i + 1) % len(loop)]
+        edge = Vector((b.x - a.x, b.y - a.y))
+        length = edge.length
+        n = normals[i]
+        far = 0.0
+        if length > 1e-9:
+            edge = edge / length
+            for _, w in pts:
+                rel = Vector((w.x - a.x, w.y - a.y))
+                t = rel.dot(edge) / length
+                if -0.05 < t < 1.05:        # roughly alongside this wall
+                    far = max(far, rel.dot(n))
+        dists.append(max(0.0, far))
+
+    tops = sorted(max((ob.matrix_world @ v.co).z for v in ob.data.vertices)
+                  for ob in mods)
+    z_top = tops[len(tops) // 2]            # median: one finial must not win
+
+    fitted = offset_loop(loop, dists)
+    for p in fitted:
+        p.z = z_top
+    note = "sat on %d edge module(s), out %.3f m, up %.3f m" % (
+        len(mods), max(dists) if dists else 0.0, z_top - z_roof)
+    return fitted, note
+
+
 class BLM_OT_gable_roof(bpy.types.Operator):
     """Replace this flat roof with a gabled one, following the shape of the
     footprint however odd it is"""
@@ -1610,11 +1741,21 @@ class BLM_OT_gable_roof(bpy.types.Operator):
                     "overhangs of two wings can run through each other")
     axis: EnumProperty(
         name="Ridge", default="AUTO",
-        items=(("AUTO", "Automatic",
+        items=(("AUTO", "Along Longest Wall",
+                "Parallel to the longest wall of the plan, the way a builder "
+                "would run it"),
+               ("BOX", "Most Compact",
                 "Along the long side of the smallest rectangle that fits the "
-                "plan"),
+                "plan. Differs from the longest wall when the plan is not "
+                "square to its own bounding box"),
                ("X", "Along X", "Force the ridge to run east-west"),
                ("Y", "Along Y", "Force the ridge to run north-south")))
+    fit_modules: BoolProperty(
+        name="Fit To Edge Assets", default=True,
+        description="Sit the eaves on the modules standing at the roof's "
+                    "edge, instead of on the bare footprint. Buildify's flat "
+                    "roof is the footprint itself, so the trim around it "
+                    "projects past the roof and stands above it")
     tiles_per_m: FloatProperty(
         name="Texture Tiles Per Metre", default=1.0, min=0.0,
         description="UVs are generated at this density, continuous across the "
@@ -1639,11 +1780,21 @@ class BLM_OT_gable_roof(bpy.types.Operator):
         loops.sort(key=len, reverse=True)
         skipped = len(loops) - 1
 
-        verts, faces = gable_roof_geometry(loops[0], self.pitch,
+        # the modules are in world space, so the fit has to be measured there
+        mw = ob.matrix_world
+        loop = [mw @ p for p in loops[0]]
+        fit_note = None
+        if self.fit_modules:
+            loop, fit_note = fit_loop_to_modules(loop, ob, context)
+
+        verts, faces = gable_roof_geometry(loop, self.pitch,
                                            self.overhang, self.axis)
         if not faces:
             self.report({"ERROR"}, "Could not roof that outline")
             return {"CANCELLED"}
+
+        inv = mw.inverted()
+        verts = [tuple(inv @ Vector(v)) for v in verts]
 
         me = bpy.data.meshes.new(ob.data.name + "_gable")
         me.from_pydata(verts, [], faces)
@@ -1671,6 +1822,8 @@ class BLM_OT_gable_roof(bpy.types.Operator):
 
         ridge = max(v[2] for v in verts) - min(v[2] for v in verts)
         note = "" if not skipped else ", ignored %d inner loop(s)" % skipped
+        if fit_note:
+            note = ", " + fit_note + note
         self.report({"INFO"}, "Gabled roof: %d faces, %.2f m from eave to "
                               "ridge%s" % (len(faces), ridge, note))
         return {"FINISHED"}

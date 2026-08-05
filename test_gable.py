@@ -209,7 +209,39 @@ ys = [v.co.y for v in ob9.data.vertices]
 check(min(ys) < -0.4 and max(ys) > 6.4,
       "and reaches past the wall on both sides")
 
-rule("7. TEXTURE RUNS ACROSS THE WHOLE ROOF")
+rule("7. THE RIDGE FOLLOWS THE LONGEST WALL")
+# A plan that is not square to its own bounding box. Its longest wall is the
+# slanted one, 11.66 m, while the smallest enclosing rectangle is the
+# axis-aligned 10 x 9 -- so the two rules genuinely disagree here, which is
+# the only way to tell which one is being used.
+S = [(0, 0), (10, 0), (10, 3), (0, 9)]
+slant = Vector((0 - 10, 9 - 3, 0)).normalized()
+u_long, _ = blm.longest_wall_axis(S)
+u_box, _ = blm.ridge_axis(S)
+print("longest wall %s   bounding box %s"
+      % (tuple(round(c, 3) for c in u_long), tuple(round(c, 3) for c in u_box)))
+check(abs(Vector((u_long[0], u_long[1], 0.0)).dot(slant)) > 0.999,
+      "longest_wall_axis returns the direction of the 11.66 m wall")
+check(abs(u_box[0]) > 0.999,
+      "ridge_axis still returns the bounding box's long side (X)")
+check(abs(u_long[0] - u_box[0]) > 0.1,
+      "the two rules really do disagree on this plan")
+
+ob_a = flat("axis_auto", S)
+me_a = roof(ob_a)
+ob_b = flat("axis_box", S)
+bpy.ops.object.select_all(action="DESELECT")
+ob_b.select_set(True)
+bpy.context.view_layer.objects.active = ob_b
+bpy.ops.blm.gable_roof(pitch=PITCH, axis="BOX")
+print("default ridge height %.3f, BOX ridge height %.3f"
+      % (max(zs(me_a)), max(zs(ob_b.data))))
+check(abs(max(zs(me_a)) - max(zs(ob_b.data))) > 1e-3,
+      "the default and BOX produce different roofs, so the default is the wall")
+check(not open_above_eaves(me_a), "the longest-wall roof is closed")
+check(not open_above_eaves(ob_b.data), "the BOX roof is closed")
+
+rule("8. TEXTURE RUNS ACROSS THE WHOLE ROOF")
 ob10 = flat("uvroof", [(0, 0), (12, 0), (12, 6), (0, 6)])
 bpy.ops.object.select_all(action="DESELECT")
 ob10.select_set(True)
