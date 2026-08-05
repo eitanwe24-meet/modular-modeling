@@ -1,0 +1,16 @@
+# Blender binaries — large, and the Buildify-derived ones are not ours to redistribute
+*.blend
+*.blend1
+*.blend2
+
+# Exported / generated geometry
+*.obj
+*.mtl
+*.fbx
+
+# Packaged builds (rebuilt from source by the packaging step)
+*.zip
+
+# Python
+__pycache__/
+*.pyc
