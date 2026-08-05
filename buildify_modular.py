@@ -420,8 +420,22 @@ def normalize_mesh(me, fit="WIDTH", slot_h=3.0):
 
 
 def mesh_from_objects(objs, deps, name="asset"):
-    """Combine several objects' visible geometry into one world-space mesh."""
+    """Combine several objects' visible geometry into one world-space mesh.
+
+    Anything living on the *loops* has to be carried across by hand.
+    `from_pydata` builds vertices and faces and nothing else, so UVs do not
+    survive it -- and a textured asset that arrives without UVs does not look
+    untextured, it looks like the texture was rescaled, because every face ends
+    up sampling the same corner of the image. Material indices have the same
+    problem and were already handled; UVs and smooth shading are here for the
+    same reason.
+    """
     verts, faces, mats, mat_index = [], [], [], {}
+    smooth = []
+    uv_names = []            # ordered: the first one stays the active layer
+    uv_values = {}           # layer name -> flat [u, v, u, v, ...] per loop
+    n_loops = 0
+
     for ob in objs:
         if ob.type != "MESH":
             continue
@@ -429,10 +443,29 @@ def mesh_from_objects(objs, deps, name="asset"):
         src = bpy.data.meshes.new_from_object(ev, preserve_all_data_layers=True,
                                               depsgraph=deps)
         src.transform(ob.matrix_world)
+
+        # a layer that only some of the objects have still has to line up with
+        # every loop recorded so far, so it starts padded
+        for layer in src.uv_layers:
+            if layer.name not in uv_values:
+                uv_names.append(layer.name)
+                uv_values[layer.name] = [0.0] * (2 * n_loops)
+
         off = len(verts)
         verts.extend([v.co.copy() for v in src.vertices])
         for poly in src.polygons:
             faces.append([off + i for i in poly.vertices])
+            smooth.append(poly.use_smooth)
+            for lname in uv_names:
+                layer = src.uv_layers.get(lname)
+                out = uv_values[lname]
+                for li in poly.loop_indices:
+                    if layer is None:
+                        out.extend((0.0, 0.0))
+                    else:
+                        out.extend(layer.data[li].uv)
+            n_loops += len(poly.vertices)
+
             m = None
             if poly.material_index < len(src.materials):
                 m = src.materials[poly.material_index]
@@ -450,6 +483,15 @@ def mesh_from_objects(objs, deps, name="asset"):
     if len(me.polygons) == len(mats):
         for p, mi in zip(me.polygons, mats):
             p.material_index = mi
+    if len(me.polygons) == len(smooth):
+        me.polygons.foreach_set("use_smooth", smooth)
+    for lname in uv_names:
+        vals = uv_values[lname]
+        if len(vals) != 2 * len(me.loops):
+            continue                       # face order disagreed: leave it out
+        layer = me.uv_layers.new(name=lname, do_init=False)
+        layer.data.foreach_set("uv", vals)
+    me.update()
     return me
 
 
