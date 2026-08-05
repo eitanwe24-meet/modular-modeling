@@ -292,13 +292,37 @@ class BLM_OT_modularize(bpy.types.Operator):
                                    "the Buildify modifier?" % building.name)
             return {"CANCELLED"}
 
+        # ---- the roof ------------------------------------------------------
+        # Not everything the node group emits is an instance. Buildify's flat
+        # roof is real mesh geometry on the building object itself -- for a
+        # square footprint, literally one quad at the top -- so the loop above
+        # never sees it. Hiding the building then took the roof with it and the
+        # building came out open-topped. Copy that geometry into a real object
+        # too, before anything gets hidden.
+        roof = None
+        roof_me = bpy.data.meshes.new_from_object(
+            building.evaluated_get(deps), preserve_all_data_layers=True,
+            depsgraph=deps)
+        if roof_me is not None:
+            if roof_me.polygons:
+                roof_me.name = building.name + "_Roof"
+                roof = bpy.data.objects.new(building.name + "_Roof", roof_me)
+                roof.matrix_world = building.matrix_world.copy()
+                # selectable and deletable like any module, but there is no
+                # library of roofs to swap it against, so it carries no slot
+                roof[P_SLOT] = ""
+                roof[P_MOD] = True
+                col.objects.link(roof)
+            else:
+                bpy.data.meshes.remove(roof_me)
+
         p.modules_collection = col
         building.hide_set(True)
         for o in context.view_layer.objects:
             o.select_set(False)
 
-        self.report({"INFO"}, "Created %d module objects (%d swappable)"
-                    % (made, swappable))
+        self.report({"INFO"}, "Created %d module objects (%d swappable)%s"
+                    % (made, swappable, " + roof" if roof else ""))
         return {"FINISHED"}
 
 
@@ -1698,52 +1722,6 @@ class BUILDIFY_OT_generate(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class BUILDIFY_OT_convert_obj(bpy.types.Operator):
-    """Export the selected object to a temporary OBJ, re-import it, and drop
-    the original -- the round trip flattens whatever the modifiers produced
-    into plain mesh data"""
-    bl_idname = "object.buildify_convert_obj"
-    bl_label = "Convert to OBJ"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None
-
-    def execute(self, context):
-        import os
-        import tempfile
-        # everything selected, not just the active object: after Build Modular
-        # Objects the building is a hundred separate objects, and converting
-        # only the active one silently threw the rest away
-        objs = [o for o in context.selected_objects if o.type == "MESH"]
-        if not objs:
-            self.report({"ERROR"}, "Select the object(s) to convert")
-            return {"CANCELLED"}
-        temp_path = os.path.join(tempfile.gettempdir(),
-                                 "%s_temp.obj" % objs[0].name)
-
-        try:
-            bpy.ops.wm.obj_export(filepath=temp_path,
-                                  export_selected_objects=True)
-        except Exception as e:
-            self.report({"ERROR"}, "Failed to export OBJ: %s" % e)
-            return {"CANCELLED"}
-
-        # re-import BEFORE deleting: the original ordering deleted first, so a
-        # failed import left nothing behind at all
-        try:
-            bpy.ops.wm.obj_import(filepath=temp_path)
-        except Exception as e:
-            self.report({"ERROR"}, "Failed to import OBJ: %s" % e)
-            return {"CANCELLED"}
-
-        for ob in objs:
-            bpy.data.objects.remove(ob, do_unlink=True)
-        self.report({"INFO"}, "Converted %d object(s) to OBJ" % len(objs))
-        return {"FINISHED"}
-
-
 class BUILDIFY_OT_optimize(bpy.types.Operator):
     """Turn the finished building into one game-ready mesh.
 
@@ -2183,18 +2161,15 @@ class BLM_PT_main(bpy.types.Panel):
         box = lay.box()
         box.label(text="Build", icon="MOD_BUILD")
         box.prop(p, "building")
-        box.operator("blm.modularize", icon="OUTLINER_OB_GROUP_INSTANCE")
+        row = box.row()
+        row.scale_y = 1.3
+        row.operator("blm.modularize", icon="OUTLINER_OB_GROUP_INSTANCE")
         if COLLECTION_ME not in bpy.data.collections:
             box.operator("blm.make_library", icon="ASSET_MANAGER")
         if p.modules_collection:
             box.label(text="%d modules in %s"
                       % (len(p.modules_collection.objects),
                          p.modules_collection.name), icon="CHECKMARK")
-
-        # ---- convert -------------------------------------------------------
-        box = lay.box()
-        box.label(text="Convert", icon="EXPORT")
-        box.operator("object.buildify_convert_obj", icon="EXPORT")
 
         # ---- selection -----------------------------------------------------
         mods = selected_modules(context)
@@ -2318,7 +2293,7 @@ CLASSES = (BLM_Props, BLM_OT_make_library, BLM_OT_gen_previews,
            BLM_OT_add_asset, BLM_OT_sync_folder, BLM_OT_import_asset_file,
            BLM_OT_open_asset_folder, BLM_OT_export_selected_to_folder,
            BUILDIFY_OT_load_modules, BUILDIFY_OT_apply_style,
-           BUILDIFY_OT_generate, BUILDIFY_OT_convert_obj, BUILDIFY_OT_optimize,
+           BUILDIFY_OT_generate, BUILDIFY_OT_optimize,
            BLM_OT_modularize, BLM_OT_swap,
            BLM_OT_cycle, BLM_OT_revert, BLM_OT_select_same, BLM_OT_select_slot,
            BLM_OT_delete, BLM_OT_export_fbx,
