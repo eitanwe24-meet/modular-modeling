@@ -115,7 +115,29 @@ if walls:
         after = [(o.name, o.data.name) for o in objs if o is not target]
         check(before == after, "no other module changed")
 
-rule("4. CONVERT TO OBJ IS GONE")
+rule("4. THE ROOF CAN BE MADE GABLED")
+# the whole point of keeping the roof: it is the thing a pitched roof is
+# built on. This runs on real Buildify output, not a synthetic polygon.
+if roofs:
+    roof = roofs[0]
+    flat_faces = len(roof.data.polygons)
+    flat_top = max((roof.matrix_world @ v.co).z for v in roof.data.vertices)
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    roof.select_set(True)
+    bpy.context.view_layer.objects.active = roof
+    bpy.ops.blm.gable_roof(pitch=35.0)
+
+    gz = [(roof.matrix_world @ v.co).z for v in roof.data.vertices]
+    print("flat roof %d face(s) at z=%.2f -> gabled %d faces, z %.2f .. %.2f"
+          % (flat_faces, flat_top, len(roof.data.polygons), min(gz), max(gz)))
+    check(len(roof.data.polygons) >= 4, "the flat roof became a pitched one")
+    check(abs(min(gz) - flat_top) < 1e-3,
+          "the eaves stayed on top of the walls")
+    check(max(gz) > flat_top + 0.5, "and it has a ridge above them")
+    check(blm.is_module(roof), "it is still selectable through the add-on")
+
+rule("5. CONVERT TO OBJ IS GONE")
 check(not hasattr(bpy.types, "BUILDIFY_OT_convert_obj"),
       "the Convert to OBJ operator is no longer registered")
 check(not hasattr(bpy.ops.object, "buildify_convert_obj")

@@ -13,7 +13,7 @@ import math
 
 import bmesh
 import bpy
-from bpy.props import (BoolProperty, FloatProperty, IntProperty,
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        PointerProperty, StringProperty)
 from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
@@ -1254,6 +1254,428 @@ class BLM_OT_spread_uv(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# =============================================================================
+# roofs
+# =============================================================================
+def _hull_2d(pts):
+    """Convex hull, monotone chain. Ties and duplicates removed first."""
+    ps = sorted(set((round(p[0], 6), round(p[1], 6)) for p in pts))
+    if len(ps) < 3:
+        return ps
+
+    def cross(o, a, b):
+        return ((a[0] - o[0]) * (b[1] - o[1])
+                - (a[1] - o[1]) * (b[0] - o[0]))
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and cross(out[-2], out[-1], p) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+
+    return half(ps)[:-1] + half(list(reversed(ps)))[:-1]
+
+
+def ridge_axis(pts):
+    """Which way the ridge should run, for any footprint shape.
+
+    The long axis of the smallest rectangle that encloses the plan. Rotating
+    calipers on the hull: the minimum-area rectangle always has a side flush
+    with a hull edge, so testing one frame per hull edge finds it exactly.
+
+    Principal-component axes were the obvious alternative and are worse here --
+    PCA is pulled around by where the vertices happen to be dense, so a plan
+    with a finely subdivided short wall claims its ridge should run across the
+    building.
+    """
+    hull = _hull_2d(pts)
+    if len(hull) < 3:
+        return (1.0, 0.0), (0.0, 1.0)
+
+    best = None
+    for i in range(len(hull)):
+        ax, ay = hull[i]
+        bx, by = hull[(i + 1) % len(hull)]
+        ex, ey = bx - ax, by - ay
+        length = math.hypot(ex, ey)
+        if length < 1e-9:
+            continue
+        ux, uy = ex / length, ey / length
+        vx, vy = -uy, ux
+        us = [p[0] * ux + p[1] * uy for p in hull]
+        vs = [p[0] * vx + p[1] * vy for p in hull]
+        w, h = max(us) - min(us), max(vs) - min(vs)
+        if best is None or w * h < best[0]:
+            best = (w * h, (ux, uy), (vx, vy), w, h)
+
+    _, u, v, w, h = best
+    if h > w:                       # ridge runs along the longer side
+        u, v = v, (-u[0], -u[1])
+    return u, v
+
+
+def boundary_loops(me):
+    """Ordered vertex positions of each boundary loop of a mesh."""
+    edge_faces = {}
+    for poly in me.polygons:
+        for key in poly.edge_keys:
+            edge_faces[key] = edge_faces.get(key, 0) + 1
+    border = [k for k, n in edge_faces.items() if n == 1]
+    if not border:
+        return []
+
+    nbrs = {}
+    for a, b in border:
+        nbrs.setdefault(a, []).append(b)
+        nbrs.setdefault(b, []).append(a)
+
+    loops, seen = [], set()
+    for start in nbrs:
+        if start in seen:
+            continue
+        loop, cur, prev = [start], start, None
+        seen.add(start)
+        while True:
+            nxt = None
+            for cand in nbrs.get(cur, ()):
+                if cand != prev and cand not in seen:
+                    nxt = cand
+                    break
+            if nxt is None:
+                break
+            loop.append(nxt)
+            seen.add(nxt)
+            prev, cur = cur, nxt
+        if len(loop) >= 3:
+            loops.append([me.vertices[i].co.copy() for i in loop])
+    return loops
+
+
+def gable_roof_geometry(loop, pitch=35.0, overhang=0.0, axis="AUTO"):
+    """Vertices and faces of a gabled roof over one closed footprint loop.
+
+    Works on any simple polygon, convex or not, by sweeping along the ridge
+    instead of assuming a rectangle. The plan is cut into slabs at every
+    vertex's ridge-coordinate; inside a slab the outline is straight, so the
+    cross-section is exactly a trapezoid and the roof over it is exactly two
+    planes -- no approximation, no subdivision to tune.
+
+    An L-shaped or U-shaped plan gives a slab more than one cross-section, and
+    each gets its own ridge, which is what makes wings work. A cross-section
+    that has no counterpart in the neighbouring slab is where the roof ends, so
+    that is where a gable wall is closed off -- which is why the gables land in
+    the right places on a shape nobody planned for.
+    """
+    if len(loop) < 3:
+        return [], []
+
+    z0 = max(p.z for p in loop)
+    pts2 = [(p.x, p.y) for p in loop]
+    if axis == "X":
+        u, v = (1.0, 0.0), (0.0, 1.0)
+    elif axis == "Y":
+        u, v = (0.0, 1.0), (-1.0, 0.0)
+    else:
+        u, v = ridge_axis(pts2)
+
+    tan_p = math.tan(math.radians(pitch))
+    eps = 1e-9
+    SNAP = 1e-4          # 0.1 mm: below any real building tolerance
+
+    # Vertices are snapped onto shared stations rather than compared against
+    # them with a tolerance. Rotate a 12 m rectangle by 40 degrees and its two
+    # long edges no longer agree on where they start to nine decimal places --
+    # one of them then fails "does this edge cross the whole slab", the
+    # crossings come out odd, and the roof silently comes out empty. Snapping
+    # makes the endpoints exactly equal, so the test can be exact too.
+    raw_u = [p[0] * u[0] + p[1] * u[1] for p in pts2]
+    raw_v = [p[0] * v[0] + p[1] * v[1] for p in pts2]
+
+    stations = []
+    for x in sorted(raw_u):
+        if not stations or x - stations[-1] > SNAP:
+            stations.append(x)
+
+    def snap(x):
+        return min(stations, key=lambda s: abs(s - x))
+
+    uv = [(snap(raw_u[i]), raw_v[i]) for i in range(len(pts2))]
+    edges = [(uv[i], uv[(i + 1) % len(uv)]) for i in range(len(uv))]
+
+    verts, index = [], {}
+
+    def vert(uu, vv, zz):
+        """Deduplicated: neighbouring slabs must share their vertices or the
+        roof comes out as loose strips."""
+        key = (round(uu, 5), round(vv, 5), round(zz, 5))
+        got = index.get(key)
+        if got is None:
+            got = index[key] = len(verts)
+            x = uu * u[0] + vv * v[0]
+            y = uu * u[1] + vv * v[1]
+            verts.append((x, y, zz))
+        return got
+
+    def spans(u0, u1):
+        """Cross-sections of the plan across one slab, as (lo, hi) pairs at
+        both ends."""
+        cuts = []
+        for (pa, pb) in edges:
+            lo_u, hi_u = min(pa[0], pb[0]), max(pa[0], pb[0])
+            if lo_u > u0 + eps or hi_u < u1 - eps:
+                continue                      # does not cross the whole slab
+            if abs(pb[0] - pa[0]) < eps:
+                continue                      # parallel to the cut
+            t0 = (u0 - pa[0]) / (pb[0] - pa[0])
+            t1 = (u1 - pa[0]) / (pb[0] - pa[0])
+            cuts.append((pa[1] + t0 * (pb[1] - pa[1]),
+                         pa[1] + t1 * (pb[1] - pa[1])))
+        # even-odd: sorted crossings pair up into inside intervals
+        cuts.sort(key=lambda c: c[0] + c[1])
+        return [(cuts[i], cuts[i + 1]) for i in range(0, len(cuts) - 1, 2)]
+
+    faces = []
+    slabs = []
+    for i in range(len(stations) - 1):
+        u0, u1 = stations[i], stations[i + 1]
+        if u1 - u0 < eps:
+            continue
+        slabs.append((u0, u1, spans(u0, u1)))
+
+    def tent(sections, vv):
+        """Height of the roof above the wall at one point of a cross-section.
+
+        Every cross-section is a tent: zero at both eaves, highest at the
+        middle. Treating the whole station as one height function of v, rather
+        than as a list of intervals, is what makes junctions fall out for free
+        below.
+        """
+        best = 0.0
+        for lo, hi in sections:
+            if lo < vv < hi:
+                best = max(best, min(vv - lo, hi - vv) * tan_p)
+        return best
+
+    def station_breaks(before, after):
+        """Where a cross-section changes shape at this station, in v.
+
+        The wall built here and the roof planes that end here have to be split
+        at the same places, so both take their vertices from this one list.
+        Give the wall a vertex the roof plane does not have and the two meet in
+        a T-junction: no visible gap, but a non-manifold edge that opens into a
+        crack as soon as the mesh is welded.
+        """
+        pts = []
+        for lo, hi in list(before) + list(after):
+            pts.extend((lo, (lo + hi) * 0.5, hi))
+        pts = sorted(set(round(b, 6) for b in pts))
+        if not before or not after or len(pts) < 2:
+            return pts
+
+        # where one cross-section overtakes the other, the region between them
+        # changes which side is on top; without a vertex there a quad would cut
+        # the corner
+        out = []
+        for j in range(len(pts) - 1):
+            v0, v1 = pts[j], pts[j + 1]
+            out.append(v0)
+            d0 = tent(before, v0) - tent(after, v0)
+            d1 = tent(before, v1) - tent(after, v1)
+            if d0 * d1 < -1e-12:
+                out.append(v0 + (v1 - v0) * d0 / (d0 - d1))
+        out.append(pts[-1])
+        return out
+
+    def between(breaks, a, b):
+        """Breakpoints strictly inside the run from a to b, in that order."""
+        lo, hi = (a, b) if a < b else (b, a)
+        inner = [x for x in breaks if lo + eps < x < hi - eps]
+        return inner if a < b else list(reversed(inner))
+
+    def wall(u_at, before, after, breaks):
+        """Close whatever the roof does not continue across this station.
+
+        At the two ends of the building this is the gable wall. In the middle
+        of an L it is the piece of wall left where a wide wing meets a narrow
+        one and the ridge steps down -- exactly the wall a real building has
+        there, and an open hole if it is skipped.
+
+        The wall is the region between the two cross-sections, so it is built
+        as the area between two height functions. That covers a plain gable
+        (one side is flat zero), a step, a wing that splits in two, and a
+        partial overlap, without any of them being special-cased.
+        """
+        if not before and not after:
+            return
+
+        if not before or not after:            # a plain end: one clean triangle
+            for lo, hi in (after or before):
+                if hi - lo < eps:
+                    continue
+                mid = (lo + hi) * 0.5
+                faces.append([vert(u_at, lo, z0),
+                              vert(u_at, hi, z0),
+                              vert(u_at, mid, z0 + (hi - lo) * 0.5 * tan_p)])
+            return
+
+        for j in range(len(breaks) - 1):
+            v0, v1 = breaks[j], breaks[j + 1]
+            if v1 - v0 < eps:
+                continue
+            a0, b0 = tent(before, v0), tent(after, v0)
+            a1, b1 = tent(before, v1), tent(after, v1)
+            lo0, hi0 = min(a0, b0), max(a0, b0)
+            lo1, hi1 = min(a1, b1), max(a1, b1)
+            if hi0 - lo0 < eps and hi1 - lo1 < eps:
+                continue                       # the two agree here: no wall
+            quad = [vert(u_at, v0, z0 + lo0), vert(u_at, v1, z0 + lo1),
+                    vert(u_at, v1, z0 + hi1), vert(u_at, v0, z0 + hi0)]
+            clean = []
+            for idx in quad:
+                if not clean or idx != clean[-1]:
+                    clean.append(idx)
+            if len(clean) > 3 and clean[0] == clean[-1]:
+                clean.pop()
+            if len(clean) >= 3:
+                faces.append(clean)
+
+    def plane(u0, u1, e0, e1, r0, r1, br0, br1, out):
+        """One sloped plane, from an eave line up to the ridge.
+
+        Split wherever either of its two stations needs a vertex, so it stays
+        welded to the wall built there. `out` is which way the overhang leans.
+        """
+        eave_z = z0 - overhang * tan_p
+        poly = [vert(u0, e0 + out * overhang, eave_z),
+                vert(u1, e1 + out * overhang, eave_z)]
+        for b in between(br1, e1, r1):
+            poly.append(vert(u1, b, z0 + abs(b - e1) * tan_p))
+        poly.append(vert(u1, r1, z0 + abs(r1 - e1) * tan_p))
+        poly.append(vert(u0, r0, z0 + abs(r0 - e0) * tan_p))
+        for b in between(br0, r0, e0):
+            poly.append(vert(u0, b, z0 + abs(b - e0) * tan_p))
+
+        clean = []
+        for idx in poly:
+            if not clean or idx != clean[-1]:
+                clean.append(idx)
+        while len(clean) > 3 and clean[0] == clean[-1]:
+            clean.pop()
+        if len(clean) >= 3:
+            faces.append(clean)
+
+    # each station's cross-sections on either side, and the breakpoints both
+    # the walls and the roof planes there must share
+    stations_data = []
+    for i in range(len(slabs) + 1):
+        before = [(lo1, hi1) for (_, lo1), (_, hi1) in slabs[i - 1][2]] \
+            if i > 0 else []
+        after = [(lo0, hi0) for (lo0, _), (hi0, _) in slabs[i][2]] \
+            if i < len(slabs) else []
+        stations_data.append((before, after, station_breaks(before, after)))
+
+    for si, (u0, u1, sections) in enumerate(slabs):
+        br0, br1 = stations_data[si][2], stations_data[si + 1][2]
+        for (lo0, lo1), (hi0, hi1) in sections:
+            mid0, mid1 = (lo0 + hi0) * 0.5, (lo1 + hi1) * 0.5
+            plane(u0, u1, lo0, lo1, mid0, mid1, br0, br1, -1.0)
+            plane(u0, u1, hi0, hi1, mid0, mid1, br0, br1, 1.0)
+
+    # every station, including the two ends: whatever the roof does not carry
+    # through gets walled off
+    for i, (before, after, breaks) in enumerate(stations_data):
+        u_at = slabs[i][0] if i < len(slabs) else slabs[-1][1]
+        wall(u_at, before, after, breaks)
+
+    return verts, faces
+
+
+class BLM_OT_gable_roof(bpy.types.Operator):
+    """Replace this flat roof with a gabled one, following the shape of the
+    footprint however odd it is"""
+    bl_idname = "blm.gable_roof"
+    bl_label = "Make Gabled Roof"
+    bl_options = {"REGISTER", "UNDO"}
+
+    pitch: FloatProperty(
+        name="Pitch", default=35.0, min=1.0, max=85.0,
+        description="Roof angle in degrees. The ridge height follows from it "
+                    "and the width, so a wider wing gets a taller ridge")
+    overhang: FloatProperty(
+        name="Overhang", default=0.0, min=0.0, soft_max=1.5, unit="LENGTH",
+        description="How far the eaves reach past the wall. Kept off by "
+                    "default: on a plan with tight inside corners the "
+                    "overhangs of two wings can run through each other")
+    axis: EnumProperty(
+        name="Ridge", default="AUTO",
+        items=(("AUTO", "Automatic",
+                "Along the long side of the smallest rectangle that fits the "
+                "plan"),
+               ("X", "Along X", "Force the ridge to run east-west"),
+               ("Y", "Along Y", "Force the ridge to run north-south")))
+    tiles_per_m: FloatProperty(
+        name="Texture Tiles Per Metre", default=1.0, min=0.0,
+        description="UVs are generated at this density, continuous across the "
+                    "whole roof. 0 leaves the roof without UVs")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH"
+
+    def execute(self, context):
+        ob = context.active_object
+        loops = boundary_loops(ob.data)
+        if not loops:
+            self.report({"ERROR"}, "%s has no open boundary to roof over. "
+                                   "Select the flat roof, not the whole "
+                                   "building." % ob.name)
+            return {"CANCELLED"}
+
+        # a courtyard plan has an inner loop too; roofing the hole as if it
+        # were a building is worse than saying so
+        loops.sort(key=len, reverse=True)
+        skipped = len(loops) - 1
+
+        verts, faces = gable_roof_geometry(loops[0], self.pitch,
+                                           self.overhang, self.axis)
+        if not faces:
+            self.report({"ERROR"}, "Could not roof that outline")
+            return {"CANCELLED"}
+
+        me = bpy.data.meshes.new(ob.data.name + "_gable")
+        me.from_pydata(verts, [], faces)
+        me.update()
+        me.validate(verbose=False)
+        for mat in ob.data.materials:
+            me.materials.append(mat)
+
+        if self.tiles_per_m > 0.0:
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            bm.faces.ensure_lookup_table()
+            layer = bm.loops.layers.uv.new("UVMap")
+            for island in material_islands(bm):
+                spread_island(island, layer, self.tiles_per_m,
+                              Vector((0.0, 0.0, 0.0)))
+            bm.to_mesh(me)
+            bm.free()
+            me.update()
+
+        old = ob.data
+        ob.data = me
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
+
+        ridge = max(v[2] for v in verts) - min(v[2] for v in verts)
+        note = "" if not skipped else ", ignored %d inner loop(s)" % skipped
+        self.report({"INFO"}, "Gabled roof: %d faces, %.2f m from eave to "
+                              "ridge%s" % (len(faces), ridge, note))
+        return {"FINISHED"}
+
+
 class BLM_OT_select_same(bpy.types.Operator):
     """Select every module that currently uses the same asset"""
     bl_idname = "blm.select_same"
@@ -2377,6 +2799,17 @@ class BLM_PT_main(bpy.types.Panel):
                       % (len(p.modules_collection.objects),
                          p.modules_collection.name), icon="CHECKMARK")
 
+        # ---- roof ----------------------------------------------------------
+        act = context.active_object
+        if act is not None and act.type == "MESH":
+            box = lay.box()
+            box.label(text="Roof", icon="HOME")
+            if act.name.endswith("_Roof"):
+                box.label(text=act.name, icon="CHECKMARK")
+            else:
+                box.label(text="Select the flat roof first", icon="INFO")
+            box.operator("blm.gable_roof", icon="MESH_CONE")
+
         # ---- selection -----------------------------------------------------
         mods = selected_modules(context)
         act = context.active_object
@@ -2506,7 +2939,8 @@ CLASSES = (BLM_Props, BLM_OT_make_library, BLM_OT_gen_previews,
            BUILDIFY_OT_generate, BUILDIFY_OT_optimize,
            BLM_OT_modularize, BLM_OT_swap,
            BLM_OT_cycle, BLM_OT_revert, BLM_OT_select_same, BLM_OT_select_slot,
-           BLM_OT_delete, BLM_OT_spread_uv, BLM_OT_export_fbx,
+           BLM_OT_delete, BLM_OT_spread_uv, BLM_OT_gable_roof,
+           BLM_OT_export_fbx,
            BLM_PT_build, BLM_PT_main, BLM_PT_finish)
 
 
