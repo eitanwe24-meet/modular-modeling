@@ -1090,6 +1090,170 @@ class BLM_OT_revert(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# =============================================================================
+# texture spread
+# =============================================================================
+def _uv_area(face, uv_layer):
+    """Area a face covers in UV space, by the shoelace formula."""
+    uvs = [l[uv_layer].uv for l in face.loops]
+    a = 0.0
+    for i in range(len(uvs)):
+        u0, v0 = uvs[i]
+        u1, v1 = uvs[(i + 1) % len(uvs)]
+        a += u0 * v1 - u1 * v0
+    return abs(a) * 0.5
+
+
+def material_islands(bm):
+    """Runs of faces that touch each other and share a material.
+
+    Two faces belong together only if you can walk from one to the other across
+    shared edges without changing material -- which is exactly "the faces with
+    the same texture that are touching".
+    """
+    seen = set()
+    islands = []
+    for face in bm.faces:
+        if face.index in seen:
+            continue
+        seen.add(face.index)
+        stack, group = [face], []
+        while stack:
+            cur = stack.pop()
+            group.append(cur)
+            for edge in cur.edges:
+                for nb in edge.link_faces:
+                    if (nb.index not in seen
+                            and nb.material_index == cur.material_index):
+                        seen.add(nb.index)
+                        stack.append(nb)
+        islands.append(group)
+    return islands
+
+
+def island_density(faces, uv_layer):
+    """Texture tiles per metre already used by these faces.
+
+    Per face this is sqrt(uv area / surface area). The median is taken rather
+    than the mean because one degenerate or unwrapped face -- area zero, or the
+    whole image on a sliver -- would otherwise drag the scale of the entire
+    wall with it.
+    """
+    ds = []
+    for f in faces:
+        ga = f.calc_area()
+        ua = _uv_area(f, uv_layer)
+        if ga > 1e-12 and ua > 1e-12:
+            ds.append(math.sqrt(ua / ga))
+    if not ds:
+        return None
+    ds.sort()
+    return ds[len(ds) // 2]
+
+
+# box projection: which two local axes each facing direction maps to, and
+# which of them runs backwards, so the image is never mirrored from outside
+_BOX_AXES = (
+    (1, 2, True, False),      # +X   u = -y, v = z
+    (1, 2, False, False),     # -X   u =  y, v = z
+    (0, 2, False, False),     # +Y   u =  x, v = z
+    (0, 2, True, False),      # -Y   u = -x, v = z
+    (0, 1, False, False),     # +Z   u =  x, v = y
+    (0, 1, False, True),      # -Z   u =  x, v = -y
+)
+
+
+def spread_island(faces, uv_layer, density, origin):
+    """Re-map one island so the texture runs continuously across all of it.
+
+    Every UV is derived from the vertex position, so two faces that share an
+    edge necessarily get the same UV on that edge -- the texture crosses the
+    join instead of restarting. Faces pointing different ways are projected
+    down their dominant axis at the same scale, so it wraps around a corner
+    without changing size.
+    """
+    for f in faces:
+        n = f.normal
+        ax = max(range(3), key=lambda i: abs(n[i]))
+        idx = ax * 2 + (0 if n[ax] >= 0 else 1)
+        iu, iv, flip_u, flip_v = _BOX_AXES[idx]
+        for loop in f.loops:
+            co = loop.vert.co - origin
+            u = co[iu] * density
+            v = co[iv] * density
+            loop[uv_layer].uv = (-u if flip_u else u, -v if flip_v else v)
+
+
+class BLM_OT_spread_uv(bpy.types.Operator):
+    """Spread each texture continuously across the faces that touch and share
+    it, instead of restarting the image on every face. Keeps the texture the
+    size it already is in the file"""
+    bl_idname = "blm.spread_uv"
+    bl_label = "Spread Texture Across Faces"
+    bl_options = {"REGISTER", "UNDO"}
+
+    tiles_per_m: FloatProperty(
+        name="Tiles Per Metre", default=0.0, min=0.0,
+        description="0 keeps whatever density the asset already uses. Set a "
+                    "value to force one, e.g. 1.0 for one tile per metre")
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context):
+        # modules share mesh data with the library asset they show, so the
+        # same mesh can arrive many times over. Doing it once per mesh keeps
+        # the work proportional to the assets, not to the building
+        meshes = []
+        for ob in context.selected_objects:
+            if ob.type == "MESH" and ob.data not in meshes:
+                meshes.append(ob.data)
+        if not meshes:
+            self.report({"ERROR"}, "Select a mesh")
+            return {"CANCELLED"}
+
+        n_islands, n_meshes, kept, forced = 0, 0, [], 0
+        for me in meshes:
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                uv_layer = bm.loops.layers.uv.new("UVMap")
+
+            origin = Vector((0.0, 0.0, 0.0))
+            for island in material_islands(bm):
+                d = None if self.tiles_per_m else island_density(island,
+                                                                 uv_layer)
+                if self.tiles_per_m:
+                    d, forced = self.tiles_per_m, forced + 1
+                elif d is None:
+                    # nothing to measure: an asset that arrived with no UVs at
+                    # all. One tile per metre is a readable default rather than
+                    # a guess dressed up as a measurement
+                    d = 1.0
+                else:
+                    kept.append(d)
+                spread_island(island, uv_layer, d, origin)
+                n_islands += 1
+
+            bm.to_mesh(me)
+            bm.free()
+            me.update()
+            n_meshes += 1
+
+        if kept:
+            kept.sort()
+            note = "kept %.3f tiles/m" % kept[len(kept) // 2]
+        else:
+            note = "forced %.3f tiles/m" % self.tiles_per_m if forced \
+                else "no UVs to measure, used 1.0 tiles/m"
+        self.report({"INFO"}, "Spread %d island(s) over %d mesh(es), %s"
+                    % (n_islands, n_meshes, note))
+        return {"FINISHED"}
+
+
 class BLM_OT_select_same(bpy.types.Operator):
     """Select every module that currently uses the same asset"""
     bl_idname = "blm.select_same"
@@ -2226,6 +2390,7 @@ class BLM_PT_main(bpy.types.Panel):
             meshes = [o for o in context.selected_objects if o.type == "MESH"]
             if meshes:
                 b.operator("blm.export_to_folder", icon="EXPORT")
+                b.operator("blm.spread_uv", icon="TEXTURE")
             return
 
         slots = {o.get(P_SLOT, "") for o in mods}
@@ -2303,6 +2468,9 @@ class BLM_PT_main(bpy.types.Panel):
         r = box.row(align=True)
         r.operator("blm.revert", icon="LOOP_BACK")
         r.operator("blm.delete", text="", icon="TRASH")
+        # the module shares its mesh with the library asset it shows, so this
+        # fixes the asset once rather than each placement of it
+        box.operator("blm.spread_uv", icon="TEXTURE")
 
 
 class BLM_PT_finish(bpy.types.Panel):
@@ -2338,7 +2506,7 @@ CLASSES = (BLM_Props, BLM_OT_make_library, BLM_OT_gen_previews,
            BUILDIFY_OT_generate, BUILDIFY_OT_optimize,
            BLM_OT_modularize, BLM_OT_swap,
            BLM_OT_cycle, BLM_OT_revert, BLM_OT_select_same, BLM_OT_select_slot,
-           BLM_OT_delete, BLM_OT_export_fbx,
+           BLM_OT_delete, BLM_OT_spread_uv, BLM_OT_export_fbx,
            BLM_PT_build, BLM_PT_main, BLM_PT_finish)
 
 
