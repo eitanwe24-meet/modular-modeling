@@ -8,6 +8,7 @@ Run: blender -b buildify_1.0.blend --python test_wizard.py
 """
 
 import csv
+import math
 import os
 import sys
 import tempfile
@@ -175,7 +176,80 @@ if os.path.isfile(pts_shp):
     check(sio.read_prj(pts_shp) == 'PROJCS["Israel_TM_Grid"]',
           "the source projection was carried across")
 
-rule("7. A LAYER IN DEGREES IS CONVERTED, NOT BUILT MILLIMETRES WIDE")
+rule("7. THE HEADING PUTS THE MODEL BACK ON ITS FOOTPRINT")
+# A 24 x 8 block turned 30 degrees anticlockwise from east. The model must come
+# out axis-aligned, and the heading must be exactly what turns it back.
+TURN = math.radians(30.0)
+
+
+def turned(cx, cy, w, h, a):
+    pts = [(-w / 2, -h / 2), (-w / 2, h / 2), (w / 2, h / 2), (w / 2, -h / 2)]
+    c, s = math.cos(a), math.sin(a)
+    out = [(cx + x * c - y * s, cy + x * s + y * c) for x, y in pts]
+    return out + [out[0]]
+
+
+rot_shp = os.path.join(TMP, "rotated.shp")
+rot_out = os.path.join(TMP, "rotated_models")
+sio.write_polygons(rot_shp, [[turned(180000.0, 663000.0, 24.0, 8.0, TURN)]],
+                   fields, [{"OBJECTID": 201, "RELATIVE_F": 9.0}],
+                   prj='PROJCS["Israel_TM_Grid"]')
+
+sys.argv = ["blender", "--", "--shp", rot_shp, "--out", rot_out, "--points"]
+wiz.main()
+
+with open(os.path.join(rot_out, "models.csv"), encoding="utf-8") as fh:
+    rot_table = list(csv.DictReader(fh))
+heading = float(rot_table[0][wiz.HEADING_FIELD])
+# gis convention: clockwise from north. 30 deg anticlockwise from east is
+# 60 deg clockwise from north
+print("footprint turned 30 deg from east -> heading %.3f (expect 60)"
+      % heading)
+check(wiz.HEADING_FIELD in rot_table[0],
+      "the csv carries the full 20-character heading name")
+check(abs(heading - 60.0) < 0.2, "the heading is measured clockwise from north")
+
+for ob in list(bpy.data.objects):
+    bpy.data.objects.remove(ob, do_unlink=True)
+bpy.ops.import_scene.fbx(filepath=os.path.join(rot_out, "bld_201.fbx"))
+mdl = [o for o in bpy.data.objects if o.type == "MESH"][0]
+mpts = [mdl.matrix_world @ v.co for v in mdl.data.vertices]
+mw = max(p.x for p in mpts) - min(p.x for p in mpts)
+mh = max(p.y for p in mpts) - min(p.y for p in mpts)
+print("model footprint %.2f x %.2f m (the block is 24 x 8)" % (mw, mh))
+check(mw > mh, "the model was built with its long side along X")
+check(abs(mw - 24.0) < 3.0 and abs(mh - 8.0) < 3.0,
+      "and at its true size: a model still turned 30 deg would measure about "
+      "25 x 19 from its bounding box")
+
+# Turn the model by the heading and it must line up with the footprint again.
+# Measured as extents along the footprint's own axes rather than by finding
+# "the far corner": a rectangle has two of those, exactly as far apart, and
+# picking either one reads as a 2 x 18.43 degree error that is not there.
+back = math.radians(90.0 - heading)          # gis heading -> maths angle
+c, s = math.cos(back), math.sin(back)
+placed = [(p.x * c - p.y * s, p.x * s + p.y * c) for p in mpts]
+
+ux, uy = math.cos(TURN), math.sin(TURN)      # the footprint's long axis
+along = [x * ux + y * uy for x, y in placed]
+across = [-x * uy + y * ux for x, y in placed]
+span_along = max(along) - min(along)
+span_across = max(across) - min(across)
+print("placed model spans %.2f m along the footprint's long axis and %.2f m "
+      "across it (block is 24 x 8)" % (span_along, span_across))
+check(abs(span_along - 24.0) < 3.0 and abs(span_across - 8.0) < 3.0,
+      "rotating the model by the heading lands it back on its footprint")
+
+# and the same measurement without the rotation must NOT fit, or the check
+# above would pass for a model that was never turned at all
+raw_along = [p.x * ux + p.y * uy for p in mpts]
+raw_across = [-p.x * uy + p.y * ux for p in mpts]
+print("unrotated, the same model spans %.2f x %.2f m on those axes"
+      % (max(raw_along) - min(raw_along), max(raw_across) - min(raw_across)))
+check(abs((max(raw_across) - min(raw_across)) - 8.0) > 3.0,
+      "and the test would have failed had the heading been ignored")
+
+rule("8. A LAYER IN DEGREES IS CONVERTED, NOT BUILT MILLIMETRES WIDE")
 deg = os.path.join(TMP, "degrees.shp")
 sio.write_polygons(deg, [[ring(34.78, 32.07, 0.00012, 0.00009)]],
                    fields, [{"OBJECTID": 1, "RELATIVE_F": 9.0}])

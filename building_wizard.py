@@ -20,6 +20,16 @@ Options:
     --points              also write a point shapefile of the centroids
     --limit N             only the first N buildings, for a trial run
     --dry-run             read and report, build nothing
+    --heading gis|math    how @mref_rotate_heading is measured. gis, the
+                          default, is degrees clockwise from north; math is
+                          degrees anticlockwise from east
+    --no-canonical        keep each model at the angle its footprint sits at,
+                          and report a heading of 0
+
+Each model is built with its main facade along +X whatever angle the building
+sits at on the ground, and @mref_rotate_heading says how far to turn it to put
+it back. Two identical blocks at different angles then produce identical
+models, and the placement carries the difference.
 
 Every model is built at its own origin, not at its map coordinates: a city in
 a projected CRS sits hundreds of kilometres from zero, where single-precision
@@ -46,6 +56,7 @@ ID_CANDIDATES = ("OBJECTID", "OBJECTID_1", "FID", "OID", "ID", "GID",
                  "BLDG_ID", "BUILDING_ID", "BUILDINGID", "OSM_ID", "UUID",
                  "CODE", "MS_KAYAN", "BLD_ID")
 MODEL_FIELD = "@mref_model"
+HEADING_FIELD = "@mref_rotate_heading"
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +93,11 @@ def ensure_addon():
 def parse_args(argv):
     args = {"shp": None, "out": None, "height-field": "RELATIVE_F",
             "id-field": None, "limit": 0, "full": False, "points": False,
-            "dry-run": False}
+            "dry-run": False, "heading": "gis", "no-canonical": False}
     i = 0
     while i < len(argv):
         key = argv[i].lstrip("-")
-        if key in ("full", "points", "dry-run"):
+        if key in ("full", "points", "dry-run", "no-canonical"):
             args[key] = True
             i += 1
         elif key in args and i + 1 < len(argv):
@@ -171,12 +182,61 @@ def model_name(poly, id_field, n):
 # ---------------------------------------------------------------------------
 # building one
 # ---------------------------------------------------------------------------
-def footprint_object(ring, name):
+def principal_direction(ring):
+    """Which way the building faces, as an angle anticlockwise from east.
+
+    The compass direction carrying the most wall, not the single longest edge.
+    A footprint digitised from aerial imagery has its long facade broken into
+    several segments, and the longest single one of those is often shorter than
+    an undivided end wall -- which would turn the building sideways.
+
+    Directions are taken modulo 180 degrees, since a wall has an orientation
+    but not a sense: a facade running east-west is the same wall either way.
+    """
+    buckets = {}
+    for i in range(len(ring)):
+        x0, y0 = ring[i]
+        x1, y1 = ring[(i + 1) % len(ring)]
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            continue
+        key = round(math.degrees(math.atan2(dy, dx)) % 180.0, 1)
+        buckets[key] = buckets.get(key, 0.0) + length
+    if not buckets:
+        return 0.0
+    return math.radians(max(buckets, key=buckets.get))
+
+
+def heading_from(theta, convention):
+    """The angle to rotate a canonical model by, to put it back on the map.
+
+    `theta` is anticlockwise from east, which is how the maths works out and
+    is not how a heading is usually written. A GIS heading is clockwise from
+    north, so the two differ by a reflection as well as a quarter turn -- get
+    that wrong and every building is mirrored about the north-south axis,
+    which looks plausible on a square plan and wrong on everything else.
+    """
+    deg = math.degrees(theta)
+    if convention == "math":
+        return round(deg % 360.0, 3)
+    return round((90.0 - deg) % 360.0, 3)
+
+
+def footprint_object(ring, name, canonical=True):
     """A flat face at the origin from one ring, wound so it faces up.
 
     Shapefile outer rings are closed and clockwise; Blender wants neither, and
     Buildify reads the border edges, so a doubled last vertex would put a
     zero-length edge in the wall run.
+
+    With `canonical` the footprint is also turned so its main facade runs along
+    +X. The model is then built in a fixed orientation whatever the building's
+    angle on the ground, and the heading needed to put it back travels in the
+    table. Two identical blocks at different angles come out as identical
+    models, which is the point.
+
+    Returns (object, map centre, theta) where theta is anticlockwise from east.
     """
     pts = list(ring)
     if len(pts) > 1 and abs(pts[0][0] - pts[-1][0]) < 1e-9 \
@@ -187,20 +247,26 @@ def footprint_object(ring, name):
         if abs(p[0] - clean[-1][0]) > 1e-6 or abs(p[1] - clean[-1][1]) > 1e-6:
             clean.append(p)
     if len(clean) < 3:
-        return None, None
+        return None, None, 0.0
     if sio.signed_area(clean) < 0.0:          # clockwise: flip to face up
         clean.reverse()
 
     cx = sum(p[0] for p in clean) / len(clean)
     cy = sum(p[1] for p in clean) / len(clean)
 
+    theta = principal_direction(clean) if canonical else 0.0
+    c, s = math.cos(-theta), math.sin(-theta)
+    local = []
+    for x, y in clean:
+        dx, dy = x - cx, y - cy
+        local.append((dx * c - dy * s, dx * s + dy * c, 0.0))
+
     me = bpy.data.meshes.new(name)
-    me.from_pydata([(p[0] - cx, p[1] - cy, 0.0) for p in clean], [],
-                   [list(range(len(clean)))])
+    me.from_pydata(local, [], [list(range(len(local)))])
     me.update()
     ob = bpy.data.objects.new(name, me)
     bpy.context.scene.collection.objects.link(ob)
-    return ob, (cx, cy)
+    return ob, (cx, cy), theta
 
 
 def set_seed(group, seed, seen=None):
@@ -302,7 +368,8 @@ def calibrate(kit):
     """
     samples = []
     for n in (2, 5):
-        ob, _ = footprint_object([(0, 0), (0, 9), (15, 9), (15, 0)], "_calib")
+        ob, _origin, _theta = footprint_object(
+            [(0, 0), (0, 9), (15, 9), (15, 0)], "_calib")
         select_only(ob)
         bpy.ops.object.buildify_generate()
         set_floors(ob, n)
@@ -434,14 +501,16 @@ def main():
             skipped.append((name, "no %s" % hf))
             continue
 
-        ob, origin = footprint_object(poly["outer"], name)
+        ob, origin, theta = footprint_object(poly["outer"], name,
+                                             canonical=not args["no-canonical"])
         if ob is None:
             skipped.append((name, "footprint has fewer than 3 corners"))
             continue
 
         row = {"index": poly["index"], "x": poly["centroid"][0],
                "y": poly["centroid"][1], "height_m": height,
-               MODEL_FIELD: name}
+               MODEL_FIELD: name,
+               HEADING_FIELD: heading_from(theta, args["heading"])}
         if id_field:
             row[id_field] = poly["attrs"].get(id_field)
 
@@ -474,8 +543,8 @@ def main():
 
     # ---- the table ---------------------------------------------------------
     csv_path = os.path.join(out_dir, "models.csv")
-    keys = ["index", MODEL_FIELD, "height_m", "floors", "built_m", "x", "y",
-            "tris"]
+    keys = ["index", MODEL_FIELD, HEADING_FIELD, "height_m", "floors",
+            "built_m", "x", "y", "tris"]
     if id_field:
         keys.insert(1, id_field)
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
@@ -486,20 +555,25 @@ def main():
 
     if args["points"]:
         pts = [(r["x"], r["y"]) for r in rows]
-        fields = [(MODEL_FIELD, "C", 64, 0), ("height_m", "N", 12, 2)]
+        fields = [(MODEL_FIELD, "C", 64, 0), (HEADING_FIELD, "N", 10, 3),
+                  ("height_m", "N", 12, 2)]
         if id_field:
             fields.append((id_field[:10], "C", 32, 0))
         prows = []
         for r in rows:
-            pr = {MODEL_FIELD: r[MODEL_FIELD], "height_m": r["height_m"]}
+            pr = {MODEL_FIELD: r[MODEL_FIELD],
+                  HEADING_FIELD: r[HEADING_FIELD],
+                  "height_m": r["height_m"]}
             if id_field:
                 pr[id_field[:10]] = str(r.get(id_field, ""))
             prows.append(pr)
         shp_path = os.path.join(out_dir, "model_points.shp")
         sio.write_points(shp_path, pts, fields, prows,
                          prj=sio.read_prj(args["shp"]))
-        print("wrote %s  (field name cut to %r -- a .dbf allows 10 characters)"
-              % (os.path.basename(shp_path), MODEL_FIELD[:10]))
+        print("wrote %s  (names cut to %r and %r -- a .dbf allows 10 "
+              "characters; the csv carries them in full)"
+              % (os.path.basename(shp_path), MODEL_FIELD[:10],
+                 HEADING_FIELD[:10]))
 
     took = time.time() - started
     print("\n%d model(s) in %s, %.1f s (%.1f s each)"
