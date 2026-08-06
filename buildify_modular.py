@@ -1723,6 +1723,190 @@ def fit_loop_to_modules(loop, roof_ob, context):
     return fitted, note
 
 
+def roof_patch(bm, up=0.5):
+    """The faces that together make up the roof.
+
+    Upward-facing faces, flood-filled from the highest one, so a roof made of
+    several polygons comes back whole while an upward-facing balcony floor
+    further down does not come with it.
+    """
+    bm.faces.ensure_lookup_table()
+    facing = [f for f in bm.faces if f.normal.z > up]
+    if not facing:
+        return []
+
+    top = max(facing, key=lambda f: max(v.co.z for v in f.verts))
+    pool = set(facing)
+    seen, stack, patch = {top}, [top], []
+    while stack:
+        cur = stack.pop()
+        patch.append(cur)
+        for edge in cur.edges:
+            for nb in edge.link_faces:
+                if nb in pool and nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+    return patch
+
+
+def _segments_cross(a0, a1, b0, b1):
+    """Do two segments cross in plan, ignoring shared endpoints?"""
+    def side(p, q, r):
+        return ((q.x - p.x) * (r.y - p.y)) - ((q.y - p.y) * (r.x - p.x))
+
+    for p in (a0, a1):
+        for q in (b0, b1):
+            if (p - q).length < 1e-7:
+                return False
+    d1, d2 = side(b0, b1, a0), side(b0, b1, a1)
+    d3, d4 = side(a0, a1, b0), side(a0, a1, b1)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _inset_survived(faces, normals):
+    """Did the inset stay a sane surface, or did it fold through itself?
+
+    Three ways it goes wrong as the inset grows, in the order they appear: a
+    face collapses to nothing, a face turns inside out and its normal flips,
+    or -- on a concave plan -- two walls sweep past each other and the inner
+    outline crosses itself while every individual face still looks fine.
+    """
+    live = [f for f in faces if f.is_valid]
+    if len(live) != len(faces):
+        return False
+    for f, n0 in zip(faces, normals):
+        if f.calc_area() < 1e-7 or f.normal.dot(n0) < 0.5:
+            return False
+
+    inner = set(faces)
+    rim = []
+    for f in faces:
+        for e in f.edges:
+            if sum(1 for lf in e.link_faces if lf in inner) == 1:
+                rim.append((e.verts[0].co, e.verts[1].co))
+    for i in range(len(rim)):
+        for j in range(i + 1, len(rim)):
+            if _segments_cross(rim[i][0], rim[i][1], rim[j][0], rim[j][1]):
+                return False
+    return True
+
+
+def largest_inset(bm, faces, steps=14):
+    """How far the roof can be inset before the topology gives out.
+
+    Found by bisection on a throwaway copy rather than derived: the collapse
+    distance of a concave outline is the straight skeleton's, and measuring it
+    is both shorter and harder to get wrong than computing it.
+    """
+    bm.faces.index_update()
+    idx = [f.index for f in faces]
+    normals = [f.normal.copy() for f in faces]
+
+    span = [v.co for f in faces for v in f.verts]
+    hi = 0.5 * min(max(p.x for p in span) - min(p.x for p in span),
+                   max(p.y for p in span) - min(p.y for p in span))
+    if hi <= 1e-6:
+        return 0.0
+
+    def works(t):
+        tmp = bm.copy()
+        tmp.faces.ensure_lookup_table()
+        tf = [tmp.faces[i] for i in idx]
+        try:
+            bmesh.ops.inset_region(tmp, faces=tf, thickness=t, depth=0.0,
+                                   use_even_offset=True, use_boundary=True,
+                                   use_interpolate=True)
+            ok = _inset_survived(tf, normals)
+        except Exception:
+            ok = False
+        tmp.free()
+        return ok
+
+    lo = 0.0
+    if works(hi):
+        return hi
+    for _ in range(steps):
+        mid = (lo + hi) * 0.5
+        if works(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+class BLM_OT_inset_roof(bpy.types.Operator):
+    """Find the roof, inset it as far as it will go, and raise the inset.
+
+    The inset is taken as one region, not face by face, so a roof built from
+    several polygons lifts as a single surface"""
+    bl_idname = "blm.inset_roof"
+    bl_label = "Raise Roof By Inset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    height: FloatProperty(
+        name="Height", default=3.0, min=0.0, soft_max=10.0, unit="LENGTH",
+        description="How far the inset is lifted. One storey reads well on a "
+                    "3 m module")
+    inset: FloatProperty(
+        name="Inset", default=0.0, min=0.0, unit="LENGTH",
+        description="0 finds the largest inset the outline survives. Set a "
+                    "value to force one")
+    margin: FloatProperty(
+        name="Safety Margin", default=0.98, min=0.1, max=1.0,
+        description="Fraction of the largest survivable inset actually used. "
+                    "At exactly the limit the ridge is a sliver a few microns "
+                    "wide, which is valid but welds badly")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH"
+
+    def execute(self, context):
+        ob = context.active_object
+        bm = bmesh.new()
+        bm.from_mesh(ob.data)
+        bm.faces.ensure_lookup_table()
+
+        patch = roof_patch(bm)
+        if not patch:
+            bm.free()
+            self.report({"ERROR"}, "No upward-facing face to treat as a roof")
+            return {"CANCELLED"}
+
+        before = sum(f.calc_area() for f in patch)
+        limit = largest_inset(bm, patch)
+        use = self.inset if self.inset > 0.0 else limit * self.margin
+        if use <= 1e-6:
+            bm.free()
+            self.report({"ERROR"}, "That roof cannot be inset at all")
+            return {"CANCELLED"}
+
+        bm.faces.index_update()
+        idx = [f.index for f in patch]
+        bmesh.ops.inset_region(bm, faces=patch, thickness=use, depth=0.0,
+                               use_even_offset=True, use_boundary=True,
+                               use_interpolate=True)
+        bm.faces.ensure_lookup_table()
+        inner = [bm.faces[i] for i in idx]
+
+        moved = {v for f in inner for v in f.verts}
+        for v in moved:
+            v.co.z += self.height
+
+        after = sum(f.calc_area() for f in inner)
+        bm.normal_update()
+        bm.to_mesh(ob.data)
+        bm.free()
+        ob.data.update()
+
+        shape = "ridge" if after < before * 0.02 else "flat top %.2f m2" % after
+        self.report({"INFO"}, "Roof: %d face(s), inset %.3f m of a possible "
+                              "%.3f, raised %.2f m -> %s"
+                    % (len(patch), use, limit, self.height, shape))
+        return {"FINISHED"}
+
+
 class BLM_OT_gable_roof(bpy.types.Operator):
     """Replace this flat roof with a gabled one, following the shape of the
     footprint however odd it is"""
@@ -2962,6 +3146,7 @@ class BLM_PT_main(bpy.types.Panel):
             else:
                 box.label(text="Select the flat roof first", icon="INFO")
             box.operator("blm.gable_roof", icon="MESH_CONE")
+            box.operator("blm.inset_roof", icon="MOD_BEVEL")
 
         # ---- selection -----------------------------------------------------
         mods = selected_modules(context)
@@ -3093,7 +3278,7 @@ CLASSES = (BLM_Props, BLM_OT_make_library, BLM_OT_gen_previews,
            BLM_OT_modularize, BLM_OT_swap,
            BLM_OT_cycle, BLM_OT_revert, BLM_OT_select_same, BLM_OT_select_slot,
            BLM_OT_delete, BLM_OT_spread_uv, BLM_OT_gable_roof,
-           BLM_OT_export_fbx,
+           BLM_OT_inset_roof, BLM_OT_export_fbx,
            BLM_PT_build, BLM_PT_main, BLM_PT_finish)
 
 
