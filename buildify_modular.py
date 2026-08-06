@@ -2763,6 +2763,16 @@ class BUILDIFY_OT_optimize(bpy.types.Operator):
     bl_label = "Optimize For Game"
     bl_options = {"REGISTER", "UNDO"}
 
+    cull: BoolProperty(
+        name="Delete Hidden Faces", default=True,
+        description="Raycast every face and delete the ones no viewer outside "
+                    "can reach. This is the expensive step -- across a batch "
+                    "of buildings it is most of the runtime")
+    dissolve: BoolProperty(
+        name="Dissolve Seams", default=True,
+        description="Merge coplanar faces that share a material, so the "
+                    "modules read as one wall instead of a grid of tiles")
+
     @classmethod
     def poll(cls, context):
         return bool(context.selected_objects)
@@ -2861,20 +2871,24 @@ class BUILDIFY_OT_optimize(bpy.types.Operator):
         bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=WELD_DISTANCE)
 
         # 5. drop everything the outside of the building cannot see
-        culled, note = cull_hidden_faces(bm)
-        if note:
-            self.report({"WARNING"}, note)
+        culled = 0
+        if self.cull:
+            culled, note = cull_hidden_faces(bm)
+            if note:
+                self.report({"WARNING"}, note)
 
         # 6. Remove the edges left between the assets. Faces that are flat with
         #    each other and carry the same material become one face, which is
         #    what stitches the panels into a continuous wall instead of a grid
         #    of tiles. Delimiting on material keeps a texture boundary from
         #    being merged away.
-        faces_before = len(bm.faces)
-        bmesh.ops.dissolve_limit(bm, angle_limit=DISSOLVE_ANGLE,
-                                 verts=bm.verts[:], edges=bm.edges[:],
-                                 delimit={"MATERIAL"})
-        merged = faces_before - len(bm.faces)
+        merged = 0
+        if self.dissolve:
+            faces_before = len(bm.faces)
+            bmesh.ops.dissolve_limit(bm, angle_limit=DISSOLVE_ANGLE,
+                                     verts=bm.verts[:], edges=bm.edges[:],
+                                     delimit={"MATERIAL"})
+            merged = faces_before - len(bm.faces)
 
         bm.to_mesh(me)
         bm.free()
