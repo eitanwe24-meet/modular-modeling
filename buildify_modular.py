@@ -2812,12 +2812,39 @@ class BUILDIFY_OT_optimize(bpy.types.Operator):
         parts = [o for o in bpy.data.objects
                  if o not in before_objs and o.type == "MESH"]
         parts.extend(o for o in sources if o.type == "MESH")
+
+        # Capture each source's OWN evaluated geometry before the modifier
+        # goes. Buildify's flat roof is real geometry on the building object
+        # rather than an instance, so duplicates_make_real never sees it, and
+        # removing the modifier below reverts the object to its bare footprint.
+        # Baking without this gave a building open at the top with a
+        # footprint-sized floor plate lying at ground level instead.
+        deps = context.evaluated_depsgraph_get()
+        own = {}
+        for o in sources:
+            if o.type == "MESH":
+                own[o.name] = bpy.data.meshes.new_from_object(
+                    o.evaluated_get(deps), preserve_all_data_layers=True,
+                    depsgraph=deps)
+
         # the sources keep their node modifier, which would rebuild the whole
         # building again on top of the joined mesh
         for o in sources:
             for mod in list(o.modifiers):
                 if mod.type == "NODES":
                     o.modifiers.remove(mod)
+
+        # swap in what the node group actually produced. An empty result means
+        # the object contributed nothing but instances, and the filter below
+        # drops it -- which is right, since its base mesh is only the outline
+        for o in sources:
+            me = own.get(o.name)
+            if me is None:
+                continue
+            old = o.data
+            o.data = me
+            if old is not me and old.users == 0:
+                bpy.data.meshes.remove(old)
 
         # After Customize the building is already real objects rather than
         # instances, so one part with geometry is a perfectly good input --

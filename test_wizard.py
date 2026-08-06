@@ -129,7 +129,37 @@ if imported:
           "and stands 9 m tall, within half a storey of the height it was "
           "given")
 
-rule("5. THE POINT LAYER")
+rule("5. THE EXPORTED MODEL HAS A ROOF")
+# Buildify's flat roof is real geometry on the building object, not an
+# instance, so duplicates_make_real does not see it -- and the bake removes
+# the modifier, which reverts the object to its bare footprint. The building
+# then came out open at the top with a floor plate at ground level instead,
+# which is only obvious if you look down at it.
+if imported:
+    ob = imported[0]
+    flats = {}
+    for p in ob.data.polygons:
+        if abs(p.normal.z) < 0.9:
+            continue
+        z = round(sum((ob.matrix_world @ ob.data.vertices[i].co).z
+                      for i in p.vertices) / len(p.vertices), 2)
+        flats[z] = flats.get(z, 0.0) + p.area
+
+    footprint = 15.0 * 9.0
+    big = {z: a for z, a in flats.items() if a > footprint * 0.6}
+    print("horizontal area by height: %s"
+          % {z: round(a, 1) for z, a in sorted(big.items())})
+    check(bool(big), "the model has a footprint-sized horizontal surface")
+    if big:
+        highest = max(big)
+        lowest = min(big)
+        print("roof-sized surface at z=%.2f, model top %.2f" % (highest, zmax))
+        check(highest > zmax - 1.5,
+              "and it is at the TOP of the building: the roof is there")
+        check(lowest > 1.0,
+              "with no stray floor plate left at ground level")
+
+rule("6. THE POINT LAYER")
 pts_shp = os.path.join(out, "model_points.shp")
 check(os.path.isfile(pts_shp), "a point shapefile was written")
 if os.path.isfile(pts_shp):
@@ -145,7 +175,7 @@ if os.path.isfile(pts_shp):
     check(sio.read_prj(pts_shp) == 'PROJCS["Israel_TM_Grid"]',
           "the source projection was carried across")
 
-rule("6. A LAYER IN DEGREES IS CONVERTED, NOT BUILT MILLIMETRES WIDE")
+rule("7. A LAYER IN DEGREES IS CONVERTED, NOT BUILT MILLIMETRES WIDE")
 deg = os.path.join(TMP, "degrees.shp")
 sio.write_polygons(deg, [[ring(34.78, 32.07, 0.00012, 0.00009)]],
                    fields, [{"OBJECTID": 1, "RELATIVE_F": 9.0}])

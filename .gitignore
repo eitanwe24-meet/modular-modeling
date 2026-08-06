@@ -14,3 +14,11 @@
 # Python
 __pycache__/
 *.pyc
+
+# virtual environments -- machine-specific, and hundreds of megabytes
+.venv/
+venv/
+env/
+
+# wizard output: models are rebuilt from the sample layer by wizard.bat
+sample/models/
