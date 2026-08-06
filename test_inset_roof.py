@@ -86,7 +86,9 @@ check(all(max(v.co.z for v in f.verts) > 5.9 for f in patch),
 bm.free()
 
 rule("2. INSET AS ONE REGION, NOT FACE BY FACE")
-data = run(ob, height=3.0)
+# gabling is off here on purpose: it slides the ridge along afterwards, and
+# this section is about where the inset itself put things
+data = run(ob, height=3.0, gabled=False)
 top = [v for v in data.vertices if v.co.z > 6.5]
 print("%d faces, %d raised vertices, z %.2f .. %.2f"
       % (len(data.polygons), len(top), min(zs(data)), max(zs(data))))
@@ -157,7 +159,58 @@ check(all(p.normal.z > -0.01 or abs(p.normal.z) < 0.9 for p in data3.polygons),
 print("L: %d faces, smallest %.5f m2, z %.2f .. %.2f"
       % (len(data3.polygons), min(areas), min(zs(data3)), max(zs(data3))))
 
-rule("5. THE CONTROLS DO WHAT THEY SAY")
+rule("5. GABLED ENDS STAND VERTICAL, HIPPED ENDS SLOPE")
+hip = flat("hipped", [(0, 0), (12, 0), (12, 6), (0, 6)])
+run(hip, height=3.0, gabled=False)
+hz = zs(hip.data)
+hip_ridge = [v.co for v in hip.data.vertices if v.co.z > 6.5]
+hip_len = max(p.x for p in hip_ridge) - min(p.x for p in hip_ridge)
+
+gab = flat("gabled", [(0, 0), (12, 0), (12, 6), (0, 6)])
+run(gab, height=3.0, gabled=True)
+gab_ridge = [v.co for v in gab.data.vertices if v.co.z > 6.5]
+gab_len = max(p.x for p in gab_ridge) - min(p.x for p in gab_ridge)
+print("ridge length: hipped %.3f m, gabled %.3f m (building is 12 m)"
+      % (hip_len, gab_len))
+check(gab_len > hip_len + 1.0, "the gabled ridge is the longer of the two")
+check(abs(gab_len - 12.0) < 1e-3, "and runs the full length of the building")
+check(abs(min(zs(gab.data)) - 6.0) < 1e-4, "the eaves did not move")
+check(abs(max(zs(gab.data)) - 9.0) < 1e-4, "nor did the ridge height")
+
+# the end faces are the ones spanning both heights. Gabled, they must be
+# vertical: a vertical face has no z in its normal.
+def end_faces(me):
+    out = []
+    for p in me.polygons:
+        pz = [me.vertices[i].co.z for i in p.vertices]
+        if max(pz) > 6.5 and min(pz) < 6.5:
+            out.append(p)
+    return out
+
+
+gab_ends = [p for p in end_faces(gab.data)
+            if abs(p.normal.x) > abs(p.normal.y)]
+hip_ends = [p for p in end_faces(hip.data)
+            if abs(p.normal.x) > abs(p.normal.y)]
+print("end faces: gabled n.z %s, hipped n.z %s"
+      % ([round(p.normal.z, 3) for p in gab_ends],
+         [round(p.normal.z, 3) for p in hip_ends]))
+check(gab_ends and all(abs(p.normal.z) < 1e-3 for p in gab_ends),
+      "gabled ends are vertical walls")
+check(hip_ends and all(abs(p.normal.z) > 0.2 for p in hip_ends),
+      "hipped ends slope, as they did before the toggle existed")
+check(not open_edges(gab.data), "the gabled roof is still a valid surface")
+check(min(p.area for p in gab.data.polygons) > 1e-6,
+      "no face collapsed when the ridge ran out")
+
+gl = flat("gabled_L", L)
+run(gl, height=3.0, gabled=True)
+check(not open_edges(gl.data), "an L survives gabling too")
+check(min(p.area for p in gl.data.polygons) > 1e-6, "with no collapsed face")
+print("gabled L: %d faces, z %.2f .. %.2f"
+      % (len(gl.data.polygons), min(zs(gl.data)), max(zs(gl.data))))
+
+rule("6. THE CONTROLS DO WHAT THEY SAY")
 ob4 = flat("h5", [(0, 0), (12, 0), (12, 6), (0, 6)])
 run(ob4, height=5.0)
 check(abs(max(zs(ob4.data)) - 11.0) < 1e-4, "height=5 raises by 5 m")

@@ -1856,6 +1856,11 @@ class BLM_OT_inset_roof(bpy.types.Operator):
         description="Fraction of the largest survivable inset actually used. "
                     "At exactly the limit the ridge is a sliver a few microns "
                     "wide, which is valid but welds badly")
+    gabled: BoolProperty(
+        name="Gabled Ends", default=True,
+        description="Run the ridge out to the end walls, so the ends stand "
+                    "vertical. Off leaves them sloping inwards, which is a "
+                    "hipped roof")
 
     @classmethod
     def poll(cls, context):
@@ -1894,6 +1899,10 @@ class BLM_OT_inset_roof(bpy.types.Operator):
         for v in moved:
             v.co.z += self.height
 
+        ends = 0
+        if self.gabled:
+            ends = self._gable_the_ends(bm, patch, inner, moved)
+
         after = sum(f.calc_area() for f in inner)
         bm.normal_update()
         bm.to_mesh(ob.data)
@@ -1901,10 +1910,66 @@ class BLM_OT_inset_roof(bpy.types.Operator):
         ob.data.update()
 
         shape = "ridge" if after < before * 0.02 else "flat top %.2f m2" % after
+        note = ", %d end vertex/vertices run out to the wall" % ends if ends \
+            else ""
         self.report({"INFO"}, "Roof: %d face(s), inset %.3f m of a possible "
-                              "%.3f, raised %.2f m -> %s"
-                    % (len(patch), use, limit, self.height, shape))
+                              "%.3f, raised %.2f m -> %s%s"
+                    % (len(patch), use, limit, self.height, shape, note))
         return {"FINISHED"}
+
+    def _gable_the_ends(self, bm, patch, inner, moved):
+        """Turn the sloping ends into vertical gables.
+
+        The inset pulls every boundary vertex inwards in two directions at
+        once: across the building, which is what makes the roof slope, and
+        along it, which is what closes the ends in and makes the roof hipped.
+        Undoing only the second component leaves the slope untouched and runs
+        the ridge out to the end walls.
+
+        Each inset vertex is still joined by an edge to the vertex it came
+        from, so the displacement is read off the mesh rather than guessed by
+        proximity -- on a narrow plan the nearest outer corner is often the
+        wrong one.
+        """
+        # Which way the ridge runs: the compass direction carrying the most
+        # wall, rather than the single longest edge. A roof split into several
+        # faces has its long wall split with it -- two 6 m edges in a line are
+        # one 12 m wall, and picking the longest single edge would call that a
+        # tie with the 6 m ends and gable the building sideways.
+        members = set(patch)
+        buckets = {}
+        for f in patch:
+            for e in f.edges:
+                if all(lf in members for lf in e.link_faces) \
+                        and len(e.link_faces) > 1:
+                    continue                   # interior to the roof patch
+                a, b = e.verts[0].co, e.verts[1].co
+                ex, ey = b.x - a.x, b.y - a.y
+                length = math.hypot(ex, ey)
+                if length < 1e-9:
+                    continue
+                key = round(math.degrees(math.atan2(ey, ex)) % 180.0)
+                buckets[key % 180] = buckets.get(key % 180, 0.0) + length
+        if not buckets:
+            return 0
+        ang = math.radians(max(buckets, key=buckets.get))
+        u = (math.cos(ang), math.sin(ang))
+
+        done = 0
+        for v in moved:
+            outers = [e.other_vert(v) for e in v.link_edges
+                      if e.other_vert(v) not in moved]
+            if not outers:
+                continue
+            src = min(outers, key=lambda w: (w.co - v.co).length)
+            d = src.co - v.co
+            along = d.x * u[0] + d.y * u[1]
+            if abs(along) < 1e-6:
+                continue
+            v.co.x += along * u[0]
+            v.co.y += along * u[1]
+            done += 1
+        return done
 
 
 class BLM_OT_gable_roof(bpy.types.Operator):
